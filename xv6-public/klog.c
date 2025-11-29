@@ -218,15 +218,46 @@ klog_printf_level(int level, const char *fmt, ...)
   klog_printf_internal(level, fmt, ap);
 }
 
-// Snapshot all logs into user buffer
+// Snapshot all logs into user buffer - returns LAST (most recent) entries
 int
 klog_snapshot(struct klog_entry *buf, int max_entries)
 {
-  int cpu_id, count = 0;
+  int cpu_id, count = 0, total = 0;
   struct klog_cpu_buf *log;
   uint start, end, i, idx, j;
+  uint min_seq = 0xFFFFFFFF;
+  int skip_count = 0;
   
-  // Collect entries from all CPUs directly into output buffer
+  // First pass: count total entries and find minimum sequence number
+  for(cpu_id = 0; cpu_id < NCPU; cpu_id++){
+    log = &cpu_logs[cpu_id];
+    acquire(&log->lock);
+    
+    if(log->head > KLOG_BUF_SIZE){
+      total += KLOG_BUF_SIZE;
+      // Find minimum sequence in this buffer
+      for(i = 0; i < KLOG_BUF_SIZE; i++){
+        if(log->entries[i].seq < min_seq)
+          min_seq = log->entries[i].seq;
+      }
+    } else {
+      total += log->head;
+      // Find minimum sequence in this buffer
+      for(i = 0; i < log->head; i++){
+        if(log->entries[i].seq < min_seq)
+          min_seq = log->entries[i].seq;
+      }
+    }
+    
+    release(&log->lock);
+  }
+  
+  // Calculate how many entries to skip (if total > max_entries, skip oldest)
+  if(total > max_entries){
+    skip_count = total - max_entries;
+  }
+  
+  // Second pass: collect entries, skipping the oldest ones
   for(cpu_id = 0; cpu_id < NCPU; cpu_id++){
     log = &cpu_logs[cpu_id];
     
@@ -241,10 +272,13 @@ klog_snapshot(struct klog_entry *buf, int max_entries)
       end = log->head;
     }
     
-    // Copy entries directly to output buffer
+    // Copy entries, skipping based on sequence number
     for(i = start; i < end && count < max_entries; i++){
       idx = i % KLOG_BUF_SIZE;
-      buf[count++] = log->entries[idx];
+      // Skip entries with sequence numbers in the skip range
+      if(log->entries[idx].seq >= min_seq + skip_count){
+        buf[count++] = log->entries[idx];
+      }
     }
     
     release(&log->lock);
